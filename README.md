@@ -36,6 +36,6 @@ ESPACIO - Fin del juego
 
 Al finalizar la simulación, se genera un archivo .csv con los logs de la simulación en la raiz del proyecto, este archivo puede ser abierto en Excel o por medio del dashboard.py.
 Para ejecutar dashboard.py, instalar librerías:
-1) pip install streamlit pandas plotly
+1) pip install streamlit pandas plotly scipy statsmodels numpy
 2) abrir una terminal en la carpeta donde se encuentre dashboard.py y ejecutar: streamlit run dashboard.py
 3) Una vez cargada la página, arrastrar el .csv con los logs de la simulación para visualizar gráficas.

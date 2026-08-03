@@ -2,7 +2,7 @@
 Soccer Simulation — Agent Emotional Analysis Dashboard
 =======================================================
 Requirements:
-    pip install streamlit pandas plotly
+    pip install streamlit pandas plotly scipy statsmodels numpy
 
 Run:
     streamlit run dashboard.py
@@ -12,6 +12,13 @@ import io
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from scipy.stats import chi2_contingency
+from scipy.stats import chi2 as chi2_dist
+import numpy as np
+import plotly.express as px
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+import patsy
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -41,6 +48,8 @@ ACTION_COLOURS = {
 }
 
 OCEAN_TRAITS = ["Openness", "Conscientiousness", "Extraversion", "Agreeableness", "Neuroticism"]
+PSYCH_VARS = OCEAN_TRAITS + ["PrevMood_P", "PrevMood_A", "PrevMood_D", "EmotionIntensity"]
+PROSOCIAL_ACTIONS = ["ComfortAlly", "CalmSituation"]
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -144,30 +153,23 @@ def action_prob_bar(sub: pd.DataFrame, colour_map: dict, height=260) -> go.Figur
 
     Hovering over a bar shows the mean OCEAN trait values of the agents
     who performed that action under the current filters.
-
-    Each bar's tooltip displays:
-      • Action name + probability + agent count
-      • Mean O / C / E / A / N for that action group
     """
     if sub.empty:
         return go.Figure()
 
     counts = sub["Action"].value_counts()
     probs  = counts / counts.sum()
-    total  = counts.sum()
 
-    # Mean OCEAN per action group
     ocean_means = (
         sub.groupby("Action")[OCEAN_TRAITS]
            .mean()
-           .reindex(counts.index)   # keep same order as counts
+           .reindex(counts.index)
     )
 
     labels  = counts.index.tolist()
     values  = probs.values.tolist()
     colours = [colour_map.get(l, "#95A5A6") for l in labels]
 
-    # Build one hover string per action
     hover_texts = []
     for action in labels:
         n   = counts[action]
@@ -194,7 +196,6 @@ def action_prob_bar(sub: pd.DataFrame, colour_map: dict, height=260) -> go.Figur
         text=[f"{v:.1%}" for v in values],
         textposition="outside",
         cliponaxis=False,
-        # Replace default tooltip entirely with our custom one
         hovertemplate="%{customdata}<extra></extra>",
         customdata=hover_texts,
     ))
@@ -215,7 +216,7 @@ def action_prob_bar(sub: pd.DataFrame, colour_map: dict, height=260) -> go.Figur
             bgcolor="white",
             bordercolor="#d0e4f7",
             font_size=13,
-            font_family="monospace",   # monospace keeps the trait columns aligned
+            font_family="monospace",
         ),
     )
     return fig
@@ -244,6 +245,17 @@ def delta_card(col, label, value):
     )
 
 
+def cramers_v(confusion_matrix):
+    chi2_stat, p, dof, expected = chi2_contingency(confusion_matrix)
+    n = confusion_matrix.to_numpy().sum()
+    phi2 = chi2_stat / n
+    r, k = confusion_matrix.shape
+    phi2corr = max(0, phi2 - ((k - 1) * (r - 1)) / (n - 1))
+    rcorr = r - ((r - 1) ** 2) / (n - 1)
+    kcorr = k - ((k - 1) ** 2) / (n - 1)
+    return np.sqrt(phi2corr / min((kcorr - 1), (rcorr - 1)))
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Upload
 # ═════════════════════════════════════════════════════════════════════════════
@@ -261,6 +273,7 @@ st.success(
     f"{df['Personality'].nunique()} personality types · "
     f"{df['EventID'].nunique()} event types"
 )
+
 st.markdown("---")
 
 ALL_PERS  = sorted(df["Personality"].unique())
@@ -508,7 +521,6 @@ else:
     counts2  = sub2["Action"].value_counts()
     probs2   = counts2 / counts2.sum()
 
-    # Mean OCEAN per action — used both in the chart tooltip and the table below
     ocean_means2 = (
         sub2.groupby("Action")[OCEAN_TRAITS]
             .mean()
@@ -520,7 +532,6 @@ else:
 
     with c2c:
         st.markdown("**P(Action)** — hover for mean OCEAN values")
-        # Pass the full filtered dataframe so action_prob_bar can compute means
         st.plotly_chart(
             action_prob_bar(sub2, ACTION_COLOURS,
                             height=max(220, len(counts2) * 54)),
@@ -559,3 +570,263 @@ else:
     )
 
 st.markdown("---")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Statistical validation — stratified by event
+# ═════════════════════════════════════════════════════════════════════════════
+st.markdown(
+    '<div class="sec">Statistical validation of personality-action association</div>',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    '<div class="filter-note">'
+    'Action probabilities differ strongly by Event, so a single pooled Chi² would '
+    'confound "which event happened" with "which personality reacted". '
+    'The Personality × Action association is therefore tested '
+    '<b>separately within each event</b>.'
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+if sub2.empty:
+    st.warning("No records match the filters above.")
+else:
+    MIN_N_PER_EVENT = 30  # minimum sample size to trust a per-event chi-square
+
+    event_rows = []
+    for ev in sorted(sub2["EventID"].unique()):
+        ev_df = sub2[sub2["EventID"] == ev]
+        if len(ev_df) < MIN_N_PER_EVENT:
+            continue
+        ct = pd.crosstab(ev_df["Personality"], ev_df["Action"])
+        ct = ct.loc[(ct.sum(axis=1) > 0), (ct.sum(axis=0) > 0)]
+        if ct.shape[0] < 2 or ct.shape[1] < 2:
+            continue
+        try:
+            chi2_e, p_e, dof_e, _ = chi2_contingency(ct)
+            v_e = cramers_v(ct)
+        except ValueError:
+            continue
+        event_rows.append({
+            "Event": ev, "n": len(ev_df), "Chi2": chi2_e, "dof": dof_e,
+            "p-value": p_e, "Cramer's V": v_e,
+            "Significant (p<.05)": "Yes" if p_e < 0.05 else "No",
+        })
+
+    event_stats_df = pd.DataFrame(event_rows)
+
+    st.markdown("**Personality × Action association, tested separately within each event**")
+    if event_stats_df.empty:
+        st.warning(
+            f"No individual event has at least {MIN_N_PER_EVENT} matching "
+            "records under the current filters, so per-event chi-square tests "
+            "cannot be computed reliably (expected cell counts would be too low)."
+        )
+    else:
+        st.dataframe(
+            event_stats_df.sort_values("p-value").reset_index(drop=True),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Chi2": st.column_config.NumberColumn(format="%.2f"),
+                "p-value": st.column_config.NumberColumn(format="%.5f"),
+                "Cramer's V": st.column_config.NumberColumn(format="%.3f"),
+            },
+        )
+        st.markdown(
+            f"<div class='filter-note'>Events with fewer than {MIN_N_PER_EVENT} "
+            "matching records are omitted.</div>",
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("Pooled Chi² across all selected events (reference only — confounds Event, kept for comparison)"):
+        contingency = pd.crosstab(sub2["Personality"], sub2["Action"])
+        fig = px.imshow(contingency, text_auto=True, aspect="auto", color_continuous_scale="Blues")
+        fig.update_layout(xaxis_title="Action", yaxis_title="Personality", height=450)
+        st.plotly_chart(fig, use_container_width=True)
+
+        chi2_pool, p_pool, dof_pool, expected_pool = chi2_contingency(contingency)
+        v_pool = cramers_v(contingency)
+
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        pc1.metric("Chi²", f"{chi2_pool:.2f}")
+        pc2.metric("Degrees of freedom", dof_pool)
+        pc3.metric("p-value", f"{p_pool:.5f}")
+        pc4.metric("Cramer's V", f"{v_pool:.3f}")
+
+        if v_pool < 0.10:
+            strength = "negligible"
+        elif v_pool < 0.30:
+            strength = "weak"
+        elif v_pool < 0.50:
+            strength = "moderate"
+        else:
+            strength = "strong"
+        st.info(f"Pooled association strength: {strength} (Cramer's V = {v_pool:.3f}). Interpret with caution — see note above.")
+
+st.markdown("---")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Inferential Analysis of Emergent Behaviors
+# ═════════════════════════════════════════════════════════════════════════════
+st.markdown(
+    '<div class="sec">Inferential Analysis of Emergent Behaviors</div>',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    '<div class="filter-note">'
+    'Identifies and inferentially analyzes instances where an agent’s observed action '
+    'deviates from the deterministic expectation of their baseline personality. Evaluates which '
+    'situational variables and mood shifts (ΔP, ΔA, ΔD, Emotion Intensity) act as '
+    'triggers for emergent responses using Robust Logistic Regression (clustered by AgentID).'
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+em1, em2 = st.columns(2)
+with em1:
+    em_mode = st.radio(
+        "Emergence Criterion:",
+        options=[
+            "Psychological (High Neuroticism / Low Agreeableness performing prosocial/peaceful action)",
+            "Statistical (Action with low expected probability given baseline OCEAN)"
+        ],
+        key="em_mode_choice"
+    )
+
+with em2:
+    if "Psychological" in em_mode:
+        n_thresh = st.slider("High Neuroticism Threshold (N ≥)", 0.0, 1.0, 0.5, 0.05, key="n_thresh")
+    else:
+        prob_thresh = st.slider("Unexpected Probability Threshold (P <)", 0.05, 0.30, 0.15, 0.01, key="p_thresh")
+
+sub_em = sub2.dropna(subset=["Action", "EventID", "AgentID"] + PSYCH_VARS + ["DeltaP", "DeltaA", "DeltaD"]).copy()
+
+if sub_em.empty or len(sub_em) < 50:
+    st.warning("Not enough records under current filters to perform inferential emergence analysis.")
+else:
+    PROSOCIAL_NON_AGGRESSIVE = ["ComfortAlly", "CalmSituation", "Boo", "WatchCalmly"]
+    
+    if "Psychological" in em_mode:
+        # Agent with high Neuroticism or low Agreeableness performing peaceful/prosocial action
+        sub_em["IsEmergent"] = (
+            ((sub_em["Neuroticism"] >= n_thresh) | (sub_em["Agreeableness"] <= 0.4)) &
+            (sub_em["Action"].isin(PROSOCIAL_NON_AGGRESSIVE))
+        ).astype(int)
+    else:
+        # Occurrence with low relative probability in global personality distribution
+        act_counts = sub_em.groupby(["Personality", "Action"]).size() / sub_em.groupby("Personality").size()
+        sub_em["BaseP"] = sub_em.apply(lambda r: act_counts.get((r["Personality"], r["Action"]), 0.0), axis=1)
+        sub_em["IsEmergent"] = (sub_em["BaseP"] < prob_thresh).astype(int)
+
+    n_em = sub_em["IsEmergent"].sum()
+    rate_em = sub_em["IsEmergent"].mean()
+
+    m_em1, m_em2, m_em3 = st.columns(3)
+    m_em1.metric("Emergent Records", f"{n_em:,}")
+    m_em2.metric("Emergence Rate", f"{rate_em:.1%}")
+    top_act = sub_em[sub_em["IsEmergent"] == 1]["Action"].mode()
+    m_em3.metric("Primary Emergent Action", top_act.iloc[0] if not top_act.empty else "N/A")
+
+    if n_em < 10 or (len(sub_em) - n_em) < 10:
+        st.warning("Requires at least 10 emergent and 10 non-emergent records to fit logistic regression.")
+    else:
+        st.markdown("**Robust Logistic Regression: Situational Triggers of Emergent Behavior**")
+        
+        # Standardize predictors for clean OR calculation
+        for col in ["DeltaP", "DeltaA", "DeltaD", "EmotionIntensity"]:
+            std_v = sub_em[col].std()
+            sub_em[f"{col}_z"] = (sub_em[col] - sub_em[col].mean()) / (std_v if std_v > 0 else 1.0)
+        
+        try:
+            logit_mod = smf.logit(
+                "IsEmergent ~ DeltaP_z + DeltaA_z + DeltaD_z + EmotionIntensity_z + C(EventID)",
+                data=sub_em
+            ).fit(cov_type="cluster", cov_kwds={"groups": sub_em["AgentID"]}, disp=False)
+            
+            params = logit_mod.params
+            bse = logit_mod.bse
+            pvalues = logit_mod.pvalues
+            
+            sit_vars = ["DeltaP_z", "DeltaA_z", "DeltaD_z", "EmotionIntensity_z"]
+            var_names_clean = {
+                "DeltaP_z": "Δ Pleasure (Mood)",
+                "DeltaA_z": "Δ Arousal (Activation)",
+                "DeltaD_z": "Δ Dominance (Control)",
+                "EmotionIntensity_z": "Emotion Intensity"
+            }
+            
+            em_rows = []
+            for v in sit_vars:
+                if v in params.index:
+                    coef = params[v]
+                    se = bse[v]
+                    pv = pvalues[v]
+                    or_val = np.exp(coef)
+                    ci_low = np.exp(coef - 1.96 * se)
+                    ci_high = np.exp(coef + 1.96 * se)
+                    em_rows.append({
+                        "Predictor": var_names_clean.get(v, v),
+                        "Coef": coef,
+                        "SE": se,
+                        "p-value": pv,
+                        "Odds Ratio (OR)": or_val,
+                        "CI_low": ci_low,
+                        "CI_high": ci_high,
+                        "Significant": pv < 0.05
+                    })
+            
+            em_res_df = pd.DataFrame(em_rows)
+            
+            f_em = go.Figure()
+            f_em.add_trace(go.Scatter(
+                x=em_res_df["Odds Ratio (OR)"],
+                y=em_res_df["Predictor"],
+                mode="markers",
+                marker=dict(
+                    size=12,
+                    color=["#2E75B6" if s else "#888" for s in em_res_df["Significant"]],
+                ),
+                error_x=dict(
+                    type="data",
+                    symmetric=False,
+                    array=em_res_df["CI_high"] - em_res_df["Odds Ratio (OR)"],
+                    arrayminus=em_res_df["Odds Ratio (OR)"] - em_res_df["CI_low"],
+                ),
+                hovertemplate="<b>%{y}</b><br>Odds Ratio: %{x:.3f}<br>p-value: %{customdata:.4f}<extra></extra>",
+                customdata=em_res_df["p-value"]
+            ))
+            f_em.add_vline(x=1.0, line_dash="dash", line_color="#999")
+            f_em.update_layout(
+                height=260,
+                xaxis_title="Odds Ratio (OR) of Emergence Trigger (OR > 1 increases likelihood)",
+                plot_bgcolor="white", paper_bgcolor="white",
+                margin=dict(l=10, r=10, t=10, b=10)
+            )
+            st.plotly_chart(f_em, use_container_width=True)
+            
+            st.dataframe(
+                em_res_df[["Predictor", "Odds Ratio (OR)", "p-value", "CI_low", "CI_high", "Significant"]],
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Odds Ratio (OR)": st.column_config.NumberColumn(format="%.3f"),
+                    "p-value": st.column_config.NumberColumn(format="%.4f"),
+                    "CI_low": st.column_config.NumberColumn("95% CI Low", format="%.3f"),
+                    "CI_high": st.column_config.NumberColumn("95% CI High", format="%.3f"),
+                }
+            )
+            
+            sig_triggers = em_res_df[em_res_df["Significant"]]
+            if not sig_triggers.empty:
+                trig_list = ", ".join(sig_triggers["Predictor"].tolist())
+                st.success(
+                    f"**Inferential Conclusion:** Situational factors that significantly trigger "
+                    f"emergent behavior in agents are: **{trig_list}** (p < 0.05, adjusted for AgentID clusters)."
+                )
+            else:
+                st.info("No single situational factor reached individual significance at p < 0.05 under this filter subset.")
+                
+        except Exception as ex:
+            st.warning(f"Could not fit robust logistic regression model for emergence: {ex}")
+
+st.markdown("---")
+
